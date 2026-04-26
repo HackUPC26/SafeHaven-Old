@@ -511,7 +511,7 @@ function GPSMap({gps, alertMode, trail, height='clamp(320px, 48vh, 560px)'}) {
 }
 
 // ── Video feed ─────────────────────────────────────────────────
-function VideoFeed({alertMode, frozen, staleSecs, videoAnnotation, videoAiStatus, liveStream, feedFrozen, annotationsEnabled}) {
+function VideoFeed({alertMode, frozen, staleSecs, videoAnnotation, videoAiStatus, liveStream, liveHasVideo, feedFrozen, annotationsEnabled}) {
   const ac = alertMode ? '#ff3b5c' : '#22d3ee';
   const poseLabel   = videoAnnotation && videoAnnotation.poseFlags && videoAnnotation.poseFlags.length > 0
     ? videoAnnotation.poseFlags[0].replace(/_/g,' ').toUpperCase()
@@ -635,12 +635,6 @@ function VideoFeed({alertMode, frozen, staleSecs, videoAnnotation, videoAiStatus
     el.muted = false;
     el.play().then(() => setNeedsTap(false)).catch(err => console.warn('[video] play failed:', err));
   }
-
-  // Live-stream branch: the visible video can be frozen while the hidden muted
-  // analysis video keeps consuming frames for annotation overlays.
-  if (liveStream) {
-    }
-  }, [liveStream, liveHasVideo]);
 
   // Live-stream branch: real video covers the area; we keep only the LIVE
   // pill, person-count chip, optional annotation overlay and corner brackets
@@ -907,7 +901,6 @@ function App() {
   const [annotationsEnabled, setAnnotationsEnabled] = useState(true);
   const [feedFrozen, setFeedFrozen] = useState(false);
   const [simulatedFreezeSecs, setSimulatedFreezeSecs] = useState(0);
-  const liveStream = useLiveStream();
   const [showTranscript, setShowTranscript] = useState(false);
   const {stream: liveStream, hasVideo: liveHasVideo} = useLiveStream();
   const audioLevels = useAudioLevels(liveStream);
@@ -1026,7 +1019,7 @@ function App() {
                 {feedFrozen ? 'RESUME FEED' : 'FREEZE FEED'}
               </button>
             </div>
-            <VideoFeed alertMode={alertMode} frozen={effectiveVideoFrozen} staleSecs={effectiveStaleSecs} videoAnnotation={visibleVideoAnnotation} videoAiStatus={videoAiStatus} liveStream={liveStream} feedFrozen={feedFrozen} annotationsEnabled={annotationsEnabled}/>
+            <VideoFeed alertMode={alertMode} frozen={effectiveVideoFrozen} staleSecs={effectiveStaleSecs} videoAnnotation={visibleVideoAnnotation} videoAiStatus={videoAiStatus} liveStream={liveStream} liveHasVideo={liveHasVideo} feedFrozen={feedFrozen} annotationsEnabled={annotationsEnabled}/>
             <AudioPanel alertMode={alertMode} audioLabels={audioLabels} levels={audioLevels}/>
             <div onClick={()=>setShowTranscript(v=>!v)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'10px',background:'rgba(255,255,255,.04)',border:'1px solid rgba(255,255,255,.08)',borderRadius:10,cursor:'pointer',color:'rgba(255,255,255,.7)',fontSize:12,fontWeight:500}}>
               <span>{showTranscript ? '▾' : '▸'}</span>

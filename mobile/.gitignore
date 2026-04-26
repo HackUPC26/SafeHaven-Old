@@ -52,3 +52,5 @@ android/app/build/
 android/.gradle/
 android/local.properties
 android/**/*.iml
+
+mobile/ios/Podfile
