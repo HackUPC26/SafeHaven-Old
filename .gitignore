@@ -20,3 +20,22 @@ xcuserdata/
 mobile/ios/mobile.xcodeproj/project.pbxproj
 p2p-hello/package-lock.json
 mobile/app.json
+
+# Xcode signing — keep DEVELOPMENT_TEAM out of version control
+# (project.pbxproj changes are intentional if signing config changes)
+
+# LevelDB / Hypercore databases
+p2p-hello/receiver-store/
+p2p-hello/.receiver-store/
+p2p-hello/.writer-store/
+p2p-hello/storage-core/
+
+# Expo
+mobile/.expo/
+
+p2p-hello/storage-core/*
+ios/SafeHaven.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+ios/.xcode.env.local
+ios/SafeHaven.xcodeproj/project.xcworkspace/contents.xcworkspacedata
+
+mobile/ios/mobile.xcodeproj/project.pbxproj

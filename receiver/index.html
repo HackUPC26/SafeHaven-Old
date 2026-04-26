@@ -139,6 +139,7 @@ function useIncidentState() {
   const [trail, setTrail]                   = useState([]);       // [{lat,lng}] movement history
   const [audioLabels, setAudioLabels]       = useState([]);       // [{time,eventType,label,conf}]
   const [incidentLog, setIncidentLog]       = useState([]);       // [{ts,label,sub,dot}]
+  const [transcripts, setTranscripts]       = useState([]);       // [{ts,text}]
   const [videoAnnotation, setVideoAnnotation] = useState(null);
   const [videoAiStatus, setVideoAiStatus]   = useState(null);
   const [videoFrozen, setVideoFrozen]       = useState(true);
@@ -205,6 +206,10 @@ function useIncidentState() {
         lastVideoRef.current = ts;
         break;
 
+      case 'transcript':
+        setTranscripts(prev => [{ts, text: payload.text}, ...prev].slice(0, 100));
+        break;
+
       case 'incident_end':
         pushLog({ts, label:'Session ended', sub:`Duration: ${Math.round(payload.durationMs / 1000)}s`, dot:'grey'});
         break;
@@ -222,6 +227,7 @@ function useIncidentState() {
     setTrail([]);
     setAudioLabels([]);
     setIncidentLog([]);
+    setTranscripts([]);
     setVideoAnnotation(null);
     setVideoAiStatus(null);
     setVideoFrozen(true);
@@ -262,17 +268,54 @@ function useIncidentState() {
   return {connected, session, tier, gps, trail, audioLabels, incidentLog, videoAnnotation, videoAiStatus, videoFrozen, staleSecs, elapsed, riskLevel, alertMode, addEntry, setConnected, reset};
 }
 
-// ── Live MediaStream channel — set by the WebRTC signaling layer below
+// ── WS-to-signaling-server connectivity. Distinct from `connected` (which
+// means an incident is active): this just reflects whether we can reach the
+// server. UI uses it to differentiate "truly offline" from "online but no
+// incident yet" so the receiver doesn't sit on a "waiting for connection"
+// spinner pre-incident.
+function useWsState() {
+  const [wsConnected, setWsConnected] = useState(!!window.__safehavenWsConnected);
+  useEffect(() => {
+    const onWs = (e) => setWsConnected(!!e.detail);
+    window.addEventListener('safehaven:wsstate', onWs);
+    return () => window.removeEventListener('safehaven:wsstate', onWs);
+  }, []);
+  return wsConnected;
+}
+
+// ── Live MediaStream channel — set by the WebRTC signaling layer below.
+// hasVideo flips true the moment a video track lands (which happens on T2
+// renegotiation, separately from the initial audio-only stream attachment).
 function useLiveStream() {
   const [stream, setStream] = useState(null);
+  const [hasVideo, setHasVideo] = useState(false);
   useEffect(() => {
     const onStream = (e) => setStream(e.detail || null);
+    const onVideo = () => setHasVideo(true);
     window.addEventListener('safehaven:stream', onStream);
-    // Pick up a stream that arrived before mount
+    window.addEventListener('safehaven:videoready', onVideo);
     if (window.__safehavenStream) setStream(window.__safehavenStream);
-    return () => window.removeEventListener('safehaven:stream', onStream);
+    if (window.__safehavenHasVideo) setHasVideo(true);
+    return () => {
+      window.removeEventListener('safehaven:stream', onStream);
+      window.removeEventListener('safehaven:videoready', onVideo);
+    };
   }, []);
-  return stream;
+  // Source of truth: the stream's actual track list. pc.ontrack can miss
+  // renegotiation track additions on some WebRTC builds, so we ALSO listen
+  // for `addtrack` on the stream itself and re-check when it changes.
+  useEffect(() => {
+    if (!stream) { setHasVideo(false); return; }
+    const recheck = () => setHasVideo(stream.getVideoTracks().length > 0);
+    recheck();
+    stream.addEventListener?.('addtrack', recheck);
+    stream.addEventListener?.('removetrack', recheck);
+    return () => {
+      stream.removeEventListener?.('addtrack', recheck);
+      stream.removeEventListener?.('removetrack', recheck);
+    };
+  }, [stream]);
+  return { stream, hasVideo };
 }
 
 // Web Audio analyser tap on the live stream — drives the LIVE AUDIO bars
@@ -512,8 +555,10 @@ function VideoFeed({alertMode, frozen, staleSecs, videoAnnotation, videoAiStatus
       }
       const p = el.play();
       if (p && p.catch) {
-        p.then(() => setNeedsTap(false))
-         .catch(() => setNeedsTap(true));
+        p.catch(() => {
+          el.muted = true;
+          el.play().catch(err => console.warn('[video] muted play also failed:', err));
+        });
       }
     } else if (el.srcObject) {
       el.srcObject = null;
@@ -594,8 +639,16 @@ function VideoFeed({alertMode, frozen, staleSecs, videoAnnotation, videoAiStatus
   // Live-stream branch: the visible video can be frozen while the hidden muted
   // analysis video keeps consuming frames for annotation overlays.
   if (liveStream) {
+    }
+  }, [liveStream, liveHasVideo]);
+
+  // Live-stream branch: real video covers the area; we keep only the LIVE
+  // pill, person-count chip, optional annotation overlay and corner brackets
+  // — the silhouette mock and P1/P2 boxes are dropped because they'd be
+  // misleading on top of an actual feed.
+  if (liveStream && liveHasVideo) {
     return (
-      <div style={{position:'relative',height:280,background:'#000',overflow:'hidden',borderRadius:12,flexShrink:0}} onClick={needsTap ? tapToPlay : undefined}>
+      <div style={{position:'relative',height:280,background:'#000',overflow:'hidden',borderRadius:12,flexShrink:0}}>
         <video ref={videoRef} autoPlay playsInline style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}}/>
         <video ref={analysisVideoRef} autoPlay muted playsInline aria-hidden="true" style={{position:'absolute',width:1,height:1,opacity:0,pointerEvents:'none'}}/>
         {showFreezeBadge && (
@@ -732,6 +785,31 @@ function AudioPanel({alertMode, audioLabels, levels}) {
   );
 }
 
+// ── Transcript panel ───────────────────────────────────────────
+function TranscriptPanel({transcripts}) {
+  return (
+    <div style={{background:'#080e1a',borderRadius:12,overflow:'hidden',border:'1px solid rgba(255,255,255,.05)'}}>
+      <div style={{padding:'10px 12px',borderBottom:'1px solid rgba(255,255,255,.06)',display:'flex',alignItems:'center',gap:8}}>
+        <div style={{width:6,height:6,borderRadius:'50%',background:'#3b82f6',animation:'recBlink 1s ease-in-out infinite'}}/>
+        <span style={{color:'rgba(255,255,255,.5)',fontSize:10,fontFamily:'monospace',letterSpacing:1}}>TRANSCRIPT</span>
+        <span style={{marginLeft:'auto',color:'rgba(255,255,255,.25)',fontSize:10,fontFamily:'monospace'}}>on-device · finals only</span>
+      </div>
+      <div style={{maxHeight:180,overflowY:'auto',scrollbarWidth:'none'}}>
+        {transcripts.length === 0 ? (
+          <div style={{padding:'16px 12px',color:'rgba(255,255,255,.2)',fontSize:12,textAlign:'center',fontFamily:'monospace'}}>
+            No speech transcribed yet
+          </div>
+        ) : transcripts.map((item,i)=>(
+          <div key={i} style={{display:'flex',alignItems:'flex-start',gap:10,padding:'8px 12px',borderBottom:i<transcripts.length-1?'1px solid rgba(255,255,255,.04)':'none'}}>
+            <div style={{color:'rgba(255,255,255,.3)',fontSize:10,fontFamily:'monospace',flexShrink:0,width:50,paddingTop:2}}>{tsToTime(item.ts)}</div>
+            <div style={{flex:1,color:i===0?'#e2e8f0':'rgba(255,255,255,.6)',fontSize:13,lineHeight:1.4,fontWeight:i===0?500:400}}>{item.text}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Risk banner ────────────────────────────────────────────────
 function RiskBanner({level, signalCount}) {
   const cfg = {
@@ -795,8 +873,22 @@ function IncidentLog({incidentLog}) {
   );
 }
 
-// ── Waiting screen ─────────────────────────────────────────────
-function WaitingScreen() {
+// ── Waiting / Idle screen ──────────────────────────────────────
+// Two modes: when WS is dead we spin and say "waiting for connection";
+// when WS is alive but no incident has fired we show a calm idle state
+// instead of the spinner — server is reachable, just nothing happening.
+function WaitingScreen({wsConnected}) {
+  if (wsConnected) {
+    return (
+      <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:14,padding:24}}>
+        <div style={{width:14,height:14,borderRadius:'50%',background:'#00d064',boxShadow:'0 0 0 0 rgba(0,208,100,.4)',animation:'pulseGreen 1.8s ease-in-out infinite'}}/>
+        <div style={{textAlign:'center'}}>
+          <div style={{color:'rgba(255,255,255,.75)',fontSize:16,fontWeight:600,marginBottom:6}}>Idle</div>
+          <div style={{color:'rgba(255,255,255,.35)',fontSize:13}}>Listening for an incident from the sender device</div>
+        </div>
+      </div>
+    );
+  }
   return (
     <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:16,padding:24}}>
       <div style={{width:48,height:48,borderRadius:'50%',border:'3px solid rgba(59,130,246,.3)',borderTop:'3px solid #3b82f6',animation:'spin 1s linear infinite'}}/>
@@ -816,7 +908,10 @@ function App() {
   const [feedFrozen, setFeedFrozen] = useState(false);
   const [simulatedFreezeSecs, setSimulatedFreezeSecs] = useState(0);
   const liveStream = useLiveStream();
+  const [showTranscript, setShowTranscript] = useState(false);
+  const {stream: liveStream, hasVideo: liveHasVideo} = useLiveStream();
   const audioLevels = useAudioLevels(liveStream);
+  const wsConnected = useWsState();
 
   const personName = session ? session.personName : null;
   const tierLabel  = tier > 0 ? `TIER ${tier}` : 'IDLE';
@@ -897,9 +992,9 @@ function App() {
               {session && <span style={{color:'rgba(255,255,255,.35)',fontSize:11,fontFamily:'monospace'}}>{mm}:{ss}</span>}
               {session && <span style={{color:'rgba(255,255,255,.2)',fontSize:11}}>·</span>}
               <div style={{display:'flex',alignItems:'center',gap:4}}>
-                <div style={{width:5,height:5,borderRadius:'50%',background: connected ? '#00d064' : '#475569'}}/>
-                <span style={{color: connected ? 'rgba(0,208,100,.7)' : 'rgba(255,255,255,.3)', fontSize:11}}>
-                  {connected ? 'Connected' : 'Disconnected'}
+                <div style={{width:5,height:5,borderRadius:'50%',background: connected ? '#00d064' : wsConnected ? '#3b82f6' : '#475569'}}/>
+                <span style={{color: connected ? 'rgba(0,208,100,.7)' : wsConnected ? 'rgba(147,197,253,.8)' : 'rgba(255,255,255,.3)', fontSize:11}}>
+                  {connected ? 'Connected' : wsConnected ? 'Idle' : 'Disconnected'}
                 </span>
               </div>
             </div>
@@ -919,7 +1014,7 @@ function App() {
 
       {/* ── SCROLLABLE CONTENT ── */}
       <div style={{flex:1, overflowY:'auto', overflowX:'hidden', scrollbarWidth:'none'}}>
-        {!connected && <WaitingScreen/>}
+        {!connected && <WaitingScreen wsConnected={wsConnected}/>}
 
         {connected && tab==='live' && (
           <div style={{display:'flex',flexDirection:'column',gap:10,animation:'slideUp .3s ease',padding:'0 14px 14px'}}>
@@ -933,6 +1028,16 @@ function App() {
             </div>
             <VideoFeed alertMode={alertMode} frozen={effectiveVideoFrozen} staleSecs={effectiveStaleSecs} videoAnnotation={visibleVideoAnnotation} videoAiStatus={videoAiStatus} liveStream={liveStream} feedFrozen={feedFrozen} annotationsEnabled={annotationsEnabled}/>
             <AudioPanel alertMode={alertMode} audioLabels={audioLabels} levels={audioLevels}/>
+            <div onClick={()=>setShowTranscript(v=>!v)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'10px',background:'rgba(255,255,255,.04)',border:'1px solid rgba(255,255,255,.08)',borderRadius:10,cursor:'pointer',color:'rgba(255,255,255,.7)',fontSize:12,fontWeight:500}}>
+              <span>{showTranscript ? '▾' : '▸'}</span>
+              <span>{showTranscript ? 'Hide' : 'Show'} transcript</span>
+              {transcripts.length > 0 && (
+                <span style={{background:'rgba(59,130,246,.2)',color:'#93c5fd',fontSize:10,fontWeight:700,padding:'1px 6px',borderRadius:99,fontFamily:'monospace'}}>
+                  {transcripts.length}
+                </span>
+              )}
+            </div>
+            {showTranscript && <TranscriptPanel transcripts={transcripts}/>}
           </div>
         )}
 
@@ -940,6 +1045,19 @@ function App() {
           <div style={{display:'flex',flexDirection:'column',gap:8,animation:'slideUp .3s ease',paddingBottom:10}}>
             <GPSMap gps={gps} alertMode={alertMode} trail={trail} height={'clamp(310px, 44vh, 520px)'}/>
             <div style={{padding:'0 14px', display:'flex', flexDirection:'column', gap:8}}>
+              {gps && (gps.address || (gps.lat != null && gps.lng != null)) && (
+                <div style={{background:'#080e1a',borderRadius:10,padding:'10px 12px',border:`1px solid ${alertMode?'rgba(255,59,92,.25)':'rgba(255,255,255,.06)'}`}}>
+                  <div style={{color:'rgba(255,255,255,.4)',fontSize:9,fontFamily:'monospace',letterSpacing:1.2,marginBottom:4}}>LOCATION</div>
+                  <div style={{color:'#e2e8f0',fontSize:13,fontWeight:500,lineHeight:1.35}}>
+                    {gps.address || `${gps.lat.toFixed(5)}°, ${gps.lng.toFixed(5)}°`}
+                  </div>
+                  {gps.address && (
+                    <div style={{color:'rgba(255,255,255,.3)',fontSize:10,fontFamily:'monospace',marginTop:3}}>
+                      {gps.lat.toFixed(5)}°, {gps.lng.toFixed(5)}°
+                    </div>
+                  )}
+                </div>
+              )}
               <div style={{display:'flex',gap:6}}>
                 <Pill label="BATTERY" value={gps && gps.battery != null ? `${Math.round(gps.battery * 100)}%` : '—'} subvalue={formatBatteryHealth(gps)} color="#34d399"/>
                 <Pill label="ACCURACY" value={gps && gps.accuracy != null ? `${gps.accuracy.toFixed(0)} m` : '—'} color="#3b82f6"/>
@@ -949,6 +1067,23 @@ function App() {
                 <Pill label="HEADING" value={gps ? headingToCardinal(gps.heading) : '—'} color="#f59e0b"/>
                 <Pill label="ALTITUDE" value={gps && gps.altitude != null ? `${gps.altitude.toFixed(0)} m` : '—'} color="#38bdf8"/>
                 {(()=>{const s=signalStrength(gps&&gps.accuracy);return <Pill label="SIGNAL" value={s.label} color={s.color}/>;})()}
+              </div>
+              <div style={{background:'#080e1a',borderRadius:10,padding:'10px 12px',border:`1px solid ${alertMode?'rgba(255,59,92,.25)':'rgba(255,255,255,.06)'}`}}>
+                <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:6}}>
+                  <div style={{width:6,height:6,borderRadius:'50%',background:alertMode?'#ff3b5c':'#3b82f6',animation:'recBlink 1s ease-in-out infinite'}}/>
+                  <span style={{color:'rgba(255,255,255,.4)',fontSize:9,fontFamily:'monospace',letterSpacing:1.2}}>NOISE RECOGNITION</span>
+                  <span style={{marginLeft:'auto',color:'rgba(255,255,255,.3)',fontSize:10,fontFamily:'monospace'}}>{audioLabels.length} event{audioLabels.length===1?'':'s'}</span>
+                </div>
+                {audioLabels.length === 0 ? (
+                  <div style={{color:'rgba(255,255,255,.25)',fontSize:11,fontFamily:'monospace',padding:'6px 0'}}>No audio events yet</div>
+                ) : audioLabels.slice(0,4).map((item,i)=>(
+                  <div key={i} style={{display:'flex',alignItems:'center',gap:8,padding:'5px 0',borderTop:i>0?'1px solid rgba(255,255,255,.04)':'none'}}>
+                    <div style={{width:6,height:6,borderRadius:'50%',background:item.eventType==='impact'?'#ff3b5c':item.eventType==='shout'?'#f59e0b':item.eventType==='silence'?'#475569':'#3b82f6',flexShrink:0}}/>
+                    <div style={{color:'rgba(255,255,255,.3)',fontSize:10,fontFamily:'monospace',width:50,flexShrink:0}}>{item.time}</div>
+                    <div style={{flex:1,color:'#e2e8f0',fontSize:12}}>{item.label}</div>
+                    <div style={{fontSize:10,fontFamily:'monospace',color:item.conf>=90?'#ff3b5c':'rgba(255,255,255,.3)'}}>{item.conf}%</div>
+                  </div>
+                ))}
               </div>
             </div>
           </div>
@@ -1032,6 +1167,11 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
   let stopped = false;
   let sessionStarted = false;
   let lastTier = 0;
+  // Set when the next offer is from a fresh sender (initial connect or after
+  // peer-disconnected). Cleared on first offer so subsequent re-offers from
+  // the same sender (T2 video renegotiation) reuse the existing PC instead
+  // of tearing down — which would lose the audio track and ICE state.
+  let nextOfferIsFresh = true;
 
   function tsOf(payload) {
     if (payload && payload.timestamp_iso) {
@@ -1047,7 +1187,20 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 
   function setStream(stream) {
     window.__safehavenStream = stream || null;
+    if (!stream) window.__safehavenHasVideo = false;
     window.dispatchEvent(new CustomEvent('safehaven:stream', { detail: stream || null }));
+  }
+
+  function setWsState(open) {
+    if (window.__safehavenWsConnected === open) return;
+    window.__safehavenWsConnected = open;
+    window.dispatchEvent(new CustomEvent('safehaven:wsstate', { detail: open }));
+  }
+
+  function markVideoReady() {
+    if (window.__safehavenHasVideo) return;
+    window.__safehavenHasVideo = true;
+    window.dispatchEvent(new CustomEvent('safehaven:videoready'));
   }
 
   // The polished UI gates everything behind a "session" (`incident_start`).
@@ -1077,13 +1230,20 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 
     if (t === 'incident_opened') {
       ensureSession(ts);
-      const toTier = payload.tier != null ? payload.tier : 1;
-      dispatchEntry({ ts, type: 'tier_change', payload: { fromTier: lastTier, toTier, trigger: 'codeword' } });
+      // Sender emits { fromTier, toTier, trigger }. Accept legacy `tier` too.
+      const toTier = payload.toTier != null ? payload.toTier
+                   : payload.tier   != null ? payload.tier
+                   : 1;
+      const fromTier = payload.fromTier != null ? payload.fromTier : lastTier;
+      dispatchEntry({ ts, type: 'tier_change', payload: { fromTier, toTier, trigger: payload.trigger || 'codeword' } });
       lastTier = toTier;
     } else if (t === 'tier_changed') {
       ensureSession(ts);
-      const toTier = payload.tier != null ? payload.tier : lastTier;
-      dispatchEntry({ ts, type: 'tier_change', payload: { fromTier: lastTier, toTier, trigger: 'codeword' } });
+      const toTier = payload.toTier != null ? payload.toTier
+                   : payload.tier   != null ? payload.tier
+                   : lastTier;
+      const fromTier = payload.fromTier != null ? payload.fromTier : lastTier;
+      dispatchEntry({ ts, type: 'tier_change', payload: { fromTier, toTier, trigger: payload.trigger || 'codeword' } });
       lastTier = toTier;
     } else if (t === 'gps_update') {
       ensureSession(ts);
@@ -1127,6 +1287,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
           source: payload.source || 'sender',
         },
       });
+    } else if (t === 'transcript') {
+      ensureSession(ts);
+      dispatchEntry({ ts, type: 'transcript', payload: { text: payload.text || '' } });
     } else if (t === 'incident_closed' || t === 'incident_ended') {
       dispatchEntry({
         ts, type: 'incident_end',
@@ -1147,14 +1310,18 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
       }
     };
 
-    pc.ontrack = ({ streams }) => {
+    pc.ontrack = ({ streams, track }) => {
       const stream = streams && streams[0];
       if (!stream) return;
       ensureSession(Date.now());
       setStream(stream);
-      // Also unfreeze the video panel so any tier-2 "feed frozen" overlay
-      // disappears the moment frames start landing.
-      dispatchEntry({ ts: Date.now(), type: 'video_chunk', payload: {} });
+      // The video panel placeholder ("Available at Tier 2+") only goes away
+      // once an actual video track lands — the audio-only attachment at T1
+      // must not unfreeze it.
+      if (track && track.kind === 'video') {
+        markVideoReady();
+        dispatchEntry({ ts: Date.now(), type: 'video_chunk', payload: {} });
+      }
     };
 
     pc.onconnectionstatechange = () => {
@@ -1180,7 +1347,10 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
     ws.onopen = () => {
       reconnectDelay = 2000;
       console.log('[recv] ws open');
-      setupPC();
+      setWsState(true);
+      // Don't preemptively build a PC here — wait for the sender's offer.
+      // Mark the next offer as fresh so the PC gets built then.
+      nextOfferIsFresh = true;
     };
 
     ws.onmessage = async (e) => {
@@ -1188,9 +1358,13 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
       try { msg = JSON.parse(e.data); } catch (_) { return; }
 
       if (msg.type === 'offer') {
-        // A fresh offer means the sender (re)joined — rebuild the PC so we
-        // don't try to renegotiate over stale ICE.
-        setupPC();
+        // Fresh sender → build a new PC. Re-offer from the same sender (T2
+        // adding a video track) → reuse the existing PC so the audio track
+        // and ICE state survive.
+        if (nextOfferIsFresh || !pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+          setupPC();
+        }
+        nextOfferIsFresh = false;
         try {
           await pc.setRemoteDescription({ type: msg.type, sdp: msg.sdp });
           const answer = await pc.createAnswer();
@@ -1203,6 +1377,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
         try { await pc.addIceCandidate(msg.candidate); } catch (_) {}
       } else if (msg.type === 'peer-disconnected') {
         setStream(null);
+        nextOfferIsFresh = true;
       } else if (msg.type === 'event') {
         translateEvent(msg.payload);
       }
@@ -1210,6 +1385,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 
     ws.onclose = (e) => {
       console.warn('[recv] ws close', e.code, e.reason);
+      setWsState(false);
       if (stopped) return;
       reconnectTimer = setTimeout(() => {
         reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);

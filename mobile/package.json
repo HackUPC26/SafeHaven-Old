@@ -10,7 +10,7 @@
     "pack:worklet": "bare-pack --linked --host ios-arm64 --host ios-arm64-simulator --host android-arm64 --out backend/worklet.bundle.mjs backend/worklet.js"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "^2.1.2",
+    "@react-native-async-storage/async-storage": "^2.2.0",
     "b4a": "^1.8.0",
     "bare-rpc": "^1.2.0",
     "corestore": "^7.9.2",
@@ -21,15 +21,17 @@
     "expo-dev-client": "~6.0.20",
     "expo-linear-gradient": "~15.0.8",
     "expo-location": "~19.0.8",
+    "expo-speech-recognition": "^3.1.3",
     "expo-status-bar": "~3.0.9",
     "hypercore": "^11.28.1",
     "hyperswarm": "^4.17.0",
     "react": "19.1.0",
     "react-native": "0.81.5",
     "react-native-bare-kit": "^0.13.3",
-    "react-native-qrcode-svg": "^6.3.15",
+    "react-native-qrcode-svg": "^6.3.21",
     "react-native-svg": "^15.9.0",
-    "react-native-webrtc": "~118.0.5"
+    "react-native-webrtc": "~118.0.5",
+    "safe-haven-ai": "file:./modules/safe-haven-ai"
   },
   "private": true,
   "devDependencies": {

@@ -26,6 +26,9 @@ const s = {
   ws: null,
   pcs: new Map(), // peerId -> RTCPeerConnection (one per viewer)
   stream: null,
+  videoTrack: null, // null until tier ≥ 2 — see setBroadcastTier()
+  addingVideo: false, // re-entrancy guard for parallel tier transitions
+  currentTier: 0, // last tier seen via setBroadcastTier — re-applied after _acquireMedia
   token: null,
   onState: null,
   active: false,
@@ -59,6 +62,9 @@ export async function startBroadcast(token, onState) {
   _setState('connecting')
   await _acquireMedia()
   if (!s.active) return
+  // If tier escalated past 2 while we were acquiring audio, attach video now
+  // before opening the WS so the first offer carries both m-lines.
+  if (s.currentTier >= 2) await _ensureVideo()
   _connect()
 }
 
@@ -68,6 +74,23 @@ export function stopBroadcast() {
   s.pending = []
   _cleanup()
   s.onState?.('idle')
+}
+
+// Tier-aware media: at T1 we only stream audio. When the sender escalates to
+// T2 we acquire the camera and renegotiate every active peer connection so
+// viewers start receiving video. Idempotent — repeated calls at the same tier
+// are no-ops, and dropping back below T2 (which the monotonic state machine
+// doesn't currently do) intentionally does not stop the camera.
+//
+// IMPORTANT: this is safe to call BEFORE startBroadcast. When called early
+// (s.stream not yet acquired) we just record the tier; startBroadcast's own
+// post-_acquireMedia hook reads s.currentTier and will call _ensureVideo()
+// once the audio stream lands. Without this contract, a direct T0→T2 jump
+// would race: setBroadcastTier(2) runs first, _ensureVideo bails (no stream),
+// and the user ends up with audio-only.
+export async function setBroadcastTier(tier) {
+  s.currentTier = tier
+  if (tier >= 2 && s.stream) await _ensureVideo()
 }
 
 export function getLocalStream() {
@@ -85,15 +108,26 @@ export function getLocalStream() {
 // is lost because it fires synchronously with the React state change.
 export function sendEvent(payload) {
   const msg = JSON.stringify({ type: 'event', payload })
+  const evType = payload?.event_type ?? 'unknown'
   if (s.ws?.readyState === WebSocket.OPEN) {
-    s.ws.send(msg)
-    return true
+    try {
+      s.ws.send(msg)
+      console.log('[broadcast] sent event', evType)
+      return true
+    } catch (err) {
+      // WS reported OPEN but send threw (briefly transitioning to CLOSING).
+      // Fall through to buffering so the event isn't lost.
+      console.warn('[broadcast] ws.send threw, buffering', evType, err?.message ?? err)
+    }
   }
-  if (s.active) {
-    s.pending.push(msg)
-    return true
-  }
-  return false
+  // Always buffer when the WS isn't open. This catches the synchronous race
+  // where escalate() fires sendEvent BEFORE the React effect has a chance to
+  // call startBroadcast — which would otherwise drop the very first tier
+  // change. Capped so an indefinitely-tier-0 session doesn't grow unbounded.
+  s.pending.push(msg)
+  if (s.pending.length > 100) s.pending.shift()
+  console.log('[broadcast] buffered event', evType, 'wsState=', s.ws?.readyState ?? 'no-ws', 'pending=', s.pending.length)
+  return true
 }
 
 // ─── Signaling connection ─────────────────────────────────────────────────────
@@ -116,6 +150,7 @@ function _connect() {
     // briefly between reconnects). This is the path that delivers tier 1's
     // incident_opened to the viewer.
     if (s.pending.length) {
+      console.log('[broadcast] flushing', s.pending.length, 'buffered events')
       for (const msg of s.pending) s.ws.send(msg)
       s.pending = []
     }
@@ -179,34 +214,67 @@ function _connect() {
 async function _acquireMedia() {
   if (s.stream) return true
 
+  // Mic is required from T1; camera is requested up-front so iOS doesn't pop
+  // a permission dialog mid-incident at T2 (would defeat the disguise). The
+  // actual camera capture is deferred until _ensureVideo() runs.
   const camPerm = await Camera.requestCameraPermissionsAsync()
   const micPerm = await Camera.requestMicrophonePermissionsAsync()
   console.log('[broadcast] cam:', camPerm.status, 'mic:', micPerm.status)
 
-  if (camPerm.status !== 'granted' || micPerm.status !== 'granted') {
-    console.error('[broadcast] permissions not granted', { cam: camPerm.status, mic: micPerm.status })
+  if (micPerm.status !== 'granted') {
+    console.error('[broadcast] microphone permission not granted')
     _setState('permission-error')
     return false
   }
 
   try {
-    s.stream = await mediaDevices.getUserMedia({
-      audio: true,
-      video: { facingMode: 'user' },
-    })
+    s.stream = await mediaDevices.getUserMedia({ audio: true, video: false })
     return true
   } catch (err) {
-    console.error('[broadcast] getUserMedia failed:', err)
-    // Graceful fallback: stream audio only if camera is unavailable
-    try {
-      s.stream = await mediaDevices.getUserMedia({ audio: true, video: false })
-      console.warn('[broadcast] audio-only fallback active')
-      return true
-    } catch (err2) {
-      console.error('[broadcast] audio-only fallback also failed:', err2)
-      _setState('permission-error')
-      return false
+    console.error('[broadcast] getUserMedia(audio) failed:', err)
+    _setState('permission-error')
+    return false
+  }
+}
+
+// Lazily acquire the camera and attach the video track to the active stream
+// and every existing PC, then renegotiate. Called by setBroadcastTier() the
+// first time tier ≥ 2.
+async function _ensureVideo() {
+  if (!s.active || !s.stream) return
+  if (s.videoTrack || s.addingVideo) return
+  s.addingVideo = true
+  try {
+    const camStream = await mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: 'user' },
+    })
+    const track = camStream.getVideoTracks()[0]
+    if (!track) {
+      console.error('[broadcast] camera returned no video track')
+      return
     }
+    s.videoTrack = track
+    s.stream.addTrack(track)
+    console.log('[broadcast] video added (tier 2)')
+
+    // Add the new track to every active PC and renegotiate. createOffer here
+    // produces an SDP that includes the video m-line; the receiver applies it
+    // and answers — no PC teardown needed.
+    for (const [peerId, pc] of s.pcs.entries()) {
+      try {
+        pc.addTrack(track, s.stream)
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        _send({ type: 'offer', peerId, sdp: offer.sdp })
+      } catch (err) {
+        console.error('[broadcast] renegotiate failed for', peerId, err)
+      }
+    }
+  } catch (err) {
+    console.error('[broadcast] camera acquisition failed:', err)
+  } finally {
+    s.addingVideo = false
   }
 }
 
@@ -261,6 +329,8 @@ function _setState(state) {
 function _cleanup() {
   try { s.stream?.getTracks().forEach(t => t.stop()) } catch {}
   s.stream = null
+  s.videoTrack = null
+  s.currentTier = 0
   for (const pc of s.pcs.values()) { try { pc.close() } catch {} }
   s.pcs.clear()
   try { s.ws?.close() } catch {}

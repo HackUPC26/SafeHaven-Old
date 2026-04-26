@@ -4,4 +4,5 @@ module.exports = {
   CMD_APPEND_ENTRY: 3,
   CMD_GET_LENGTH: 4,
   CMD_JOIN_SWARM: 5,
+  CMD_TIER_CHANGE: 6,
 }

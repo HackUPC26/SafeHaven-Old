@@ -1,4 +1,4 @@
-s/* global BareKit */
+/* global BareKit */
 require('bare-buffer/global')
 
 const RPC = require('bare-rpc')
@@ -68,16 +68,53 @@ function pickStoragePath() {
   return null
 }
 
+// Best-effort: remove any stale lock files from a previous worklet instance
+// that didn't fully release its grip (common after hot reload, force-quit, or
+// crash). Corestore/rocksdb drops a `LOCK` file under the storage dir; if it
+// survives, the next boot fails with "File descriptor could not be locked".
+function clearStaleLocks(dir) {
+  const targets = ['LOCK', 'lockfile', 'rocksdb-LOCK']
+  for (const name of targets) {
+    const p = path.join(dir, name)
+    try {
+      fs.unlinkSync(p)
+      diag('clearStaleLocks: removed ' + p)
+    } catch (err) {
+      // ENOENT is fine (no stale lock); other errors we just log.
+      if (err.code && err.code !== 'ENOENT') {
+        diag('clearStaleLocks: ' + p + ' err=' + err.code)
+      }
+    }
+  }
+}
+
+async function tryInit(p) {
+  diag('init: new Corestore at ' + p)
+  store = new Corestore(p)
+  await store.ready()
+  diag('init: Corestore ready')
+  core = store.get({ name: 'incident' })
+  await core.ready()
+  diag('init: core ready, key=' + b4a.toString(core.key, 'hex').slice(0, 16) + '…')
+}
+
 function init(p) {
   if (readyPromise) return readyPromise
   readyPromise = (async () => {
-    diag('init: new Corestore at ' + p)
-    store = new Corestore(p)
-    await store.ready()
-    diag('init: Corestore ready')
-    core = store.get({ name: 'incident' })
-    await core.ready()
-    diag('init: core ready, key=' + b4a.toString(core.key, 'hex').slice(0, 16) + '…')
+    try {
+      await tryInit(p)
+    } catch (err) {
+      const msg = String(err.message || '')
+      if (msg.includes('could not be locked') || msg.includes('Resource temporarily unavailable')) {
+        diag('init: lock collision, clearing stale locks and retrying')
+        store = null
+        core = null
+        clearStaleLocks(p)
+        await tryInit(p)
+      } else {
+        throw err
+      }
+    }
   })()
   return readyPromise
 }

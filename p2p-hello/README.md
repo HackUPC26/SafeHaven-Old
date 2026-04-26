@@ -9,6 +9,7 @@ SafeHaven mobile app:
 
 ---
 
+
 ## WebRTC Streaming Pipeline
 
 Live video + audio from an iPhone sender to any browser or native receiver, with no cloud media relay. Signaling uses a lightweight WebSocket server; media travels directly peer-to-peer over DTLS-SRTP (encrypted by WebRTC by default).

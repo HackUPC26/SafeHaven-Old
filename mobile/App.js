@@ -7,8 +7,10 @@ import * as Location from 'expo-location';
 import { requireOptionalNativeModule } from 'expo-modules-core';
 import { connect, send } from './services/bridge';
 import { loadSettings } from './services/settings';
-import { startBroadcast, stopBroadcast } from './services/broadcast';
 import { startSoundClassification, startVideoAnnotation, stopSoundClassification, stopVideoAnnotation } from './services/ai';
+import { startBroadcast, stopBroadcast, setBroadcastTier } from './services/broadcast';
+import { getTier, escalate, subscribe, Tier } from './services/TierStateMachine';
+import CodewordListener from './components/CodewordListener';
 import SettingsScreen from './screens/SettingsScreen';
 
 const DEFAULT_CODEWORDS = { TIER1: 'sunny', TIER2: 'cloudy', TIER3: 'stormy' };
@@ -100,25 +102,33 @@ function useHold(onFire, durationMs = 3000) {
 }
 
 export default function App() {
-  const [tier, setTier] = useState(0);
+  const [tier, setTier] = useState(getTier());
   const [sent, setSent] = useState(false);
   const [settings, setSettings] = useState({ name: '', codewords: DEFAULT_CODEWORDS, pairingId: '' });
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [codewordInput, setCodewordInput] = useState('');
   const locationRef = useRef(null);
 
   useEffect(() => {
     connect();
     loadSettings().then(s => setSettings(s));
+    // Sound classification has to run from boot — its whole purpose is to
+    // ESCALATE the tier on detected sounds (gunshot → T3, scream → T3, etc.
+    // per LABEL_TIER in services/ai.js). Gating it on tier >= 1 made it
+    // unreachable from idle: nothing could ever trigger the first escalation.
+    startSoundClassification();
+    const unsub = subscribe((newTier) => setTier(newTier));
+    return () => {
+      unsub();
+      stopSoundClassification();
+    };
   }, []);
 
   // SOS trigger — hold H/L row 3s
   const sos = useHold(() => {
     setSent(true);
     setTimeout(() => setSent(false), 1200);
-    if (tier === 0) {
-      setTier(1);
-      send({ event_type: 'incident_opened', tier: 1 });
-    }
+    escalate(Tier.T1, 'manual');
   }, 3000);
 
   useEffect(() => {
@@ -126,21 +136,29 @@ export default function App() {
     if (tier === 0) stopGPS();
   }, [tier]);
 
-  // Silent broadcast: starts at tier ≥ 1 (audio + video tracks; the receiver
-  // PWA decides what to render). No UI surface — disguise stays intact.
+  // Silent broadcast: T1 streams audio only, T2+ adds video. The receiver
+  // PWA decides what to render. No UI surface — disguise stays intact.
   // Token = pubkey portion of pairingId so the receiver page's existing
   // /#<token> flow works unchanged.
   useEffect(() => {
-    if (!settings.pairingId) return;
+    if (!settings.pairingId) {
+      if (tier >= 1) console.warn('[App] tier escalated but pairingId is empty — receiver will see nothing. Open settings (long-press Barcelona 2s) and pair.');
+      return;
+    }
     const token = settings.pairingId.split(':')[0];
-    if (tier >= 1) startBroadcast(token);
-    else stopBroadcast();
+    if (tier >= 1) {
+      console.log('[App] starting broadcast for tier', tier, 'token=', token.slice(0, 8) + '…');
+      startBroadcast(token);
+    } else {
+      stopBroadcast();
+    }
   }, [tier >= 1, settings.pairingId]);
 
+  // Push tier transitions into the broadcast service so it can lazily attach
+  // the camera at T2 and renegotiate every active peer.
   useEffect(() => {
-    if (tier >= 1) startSoundClassification();
-    else stopSoundClassification();
-  }, [tier >= 1]);
+    if (tier >= 1) setBroadcastTier(tier);
+  }, [tier]);
 
   useEffect(() => {
     if (tier >= 2) startVideoAnnotation();
@@ -148,16 +166,35 @@ export default function App() {
   }, [tier >= 2]);
 
   function checkCodeword(text) {
+    setCodewordInput(text);
     const word = text.toLowerCase().trim();
+    if (!word) return;
     const cw = settings.codewords;
-    if (word === cw.TIER1 && tier === 0) { setTier(1); send({ event_type: 'tier_changed', tier: 1 }); }
-    if (word === cw.TIER2 && tier === 1) { setTier(2); send({ event_type: 'tier_changed', tier: 2 }); }
-    if (word === cw.TIER3 && tier === 2) { setTier(3); send({ event_type: 'tier_changed', tier: 3 }); }
+    const t1 = cw.TIER1?.toLowerCase();
+    const t2 = cw.TIER2?.toLowerCase();
+    const t3 = cw.TIER3?.toLowerCase();
+    // Substring match (highest tier first) so the three-stage progression
+    // works without manually clearing the field — typing "sunny" then
+    // "cloudy" then "stormy" escalates T1→T2→T3 even though each new word
+    // appends to the prior text. We clear the input after a match so the
+    // next codeword starts fresh.
+    let matched = null;
+    if (t3 && word.includes(t3)) matched = Tier.T3;
+    else if (t2 && word.includes(t2)) matched = Tier.T2;
+    else if (t1 && word.includes(t1)) matched = Tier.T1;
+    if (matched != null) {
+      escalate(matched, 'codeword');
+      setCodewordInput('');
+    }
   }
 
   async function startGPS() {
+    // Idempotent — a tier change from 1→2→3 must not stack watchers, since
+    // the [tier] effect fires on every transition.
+    if (locationRef.current) return;
     const { status } = await Location.requestForegroundPermissionsAsync();
     if (status !== 'granted') return;
+    if (locationRef.current) return; // re-check after the await
     locationRef.current = await Location.watchPositionAsync(
       { timeInterval: 3000, distanceInterval: 0 },
       async (loc) => {
@@ -223,13 +260,6 @@ export default function App() {
           {/* silent sent flash */}
           {sent && <View style={styles.sentFlash} />}
 
-          {/* hidden codeword input */}
-          <TextInput
-            style={styles.hiddenInput}
-            onChangeText={checkCodeword}
-            placeholder="Search weather..."
-            placeholderTextColor="rgba(255,255,255,0.4)"
-          />
 
           {/* hourly strip */}
           <View style={styles.card}>
@@ -274,6 +304,8 @@ export default function App() {
           <View style={styles.bottomPad} />
         </ScrollView>
       </LinearGradient>
+
+      <CodewordListener codewords={settings.codewords} />
 
       {settingsOpen && (
         <SettingsScreen
